@@ -1572,7 +1572,7 @@ class Coder:
         if added_fnames:
             return prompts.added_files.format(fnames=", ".join(added_fnames))
 
-    def _compute_revision(self, messages, original, model, functions, streaming, temp):
+    def compute_hints(self, messages, original, model, functions, streaming, temp):
         # now give this back to the model and ask it to reflect on it's own output
         messages = list(messages)
         messages.append(
@@ -1673,24 +1673,25 @@ hint block as well as your suggestion for how to handle them.
             original, function_calls = accumulate_stream(completion, streaming=self.stream)
 
             # ask the model to reflect on the first response.
-            revision = self._compute_revision(
-                messages, original, model, functions, self.stream, temp
-            )
+            hints = self.compute_hints(messages, original, model, functions, self.stream, temp)
 
             # okay, now let's go back to the model and have it supply new diffs.
-            if revision:
-                messages.append(
-                    dict(
-                        role="user",
-                        content=f"""
-  Here's some ideas on how you might best approach the problem. When producing
-  your answer, explain your reasoning and exactly how you plan to address each
-  proposed problem.
-
-  {revision}
+            hint_message = dict(
+                role="user",
+                content=f"""
+  Here's some hints on how you might best approach the problem. When producing
+  your answer, make sure to take these hints into account, they might help you
+  get the solution right the first time! Ignore the hints if they don't seem to
+  be helpful to you.
+  <HINTS>
+  {hints}
+  </HINTS>
   """,
-                    )
-                )
+            )
+            if hints:
+                messages.append(hint_message)
+
+            self.cur_messages += [hint_message]
             hash_object, completion = send_completion(
                 model.name,
                 messages,
