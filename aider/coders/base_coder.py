@@ -73,8 +73,9 @@ all_fences = [
 def accumulate_stream(completion, streaming):
     if not streaming:
         function_calls = completion.choices[0].message.tool_calls
-        text = completion.choices[0].message.content
-        return text, function_calls
+        content = completion.choices[0].message.content
+        print("Intermediate response: ", content.replace("\n", "\n >>"))
+        return content, function_calls
 
     text = []
     function_calls = collections.defaultdict(int)
@@ -101,9 +102,9 @@ def accumulate_stream(completion, streaming):
         try:
             text.append(chunk.choices[0].delta.content)
         except AttributeError:
-            text = None
+            pass
 
-    return text, function_calls
+    return "".join(text), function_calls
 
 
 class Coder:
@@ -1571,6 +1572,78 @@ class Coder:
         if added_fnames:
             return prompts.added_files.format(fnames=", ".join(added_fnames))
 
+    def _compute_revision(self, messages, original, model, functions, streaming, temp):
+        # now give this back to the model and ask it to reflect on it's own output
+        messages = list(messages)
+        messages.append(
+            dict(
+                role="user",
+                content=f"""<ANSWER>\n\n{original}\n</ANSWER>""",
+            )
+        )
+        messages.append(
+            dict(
+                role="user",
+                content="""
+      
+You are grading a response to a user request. The user asked for feedback on a proposed solution to a problem.
+
+Look at the previous answer. Does this response satisfy the request? What hints
+would you provide to help the author improve their response?
+
+Do not output any code. Just give a high-level explanation of things to _pay
+attention to_ when generating a response.  Give your response in a forward
+looking fashion, viz. "Here's some things to look out for".
+
+Here are some example scenarios and responses:
+
+1. If the original proposal used a greedy algorithm but that seems insufficient:
+"A a greedy approach works for simple cases but could fail for edge cases. 
+A dynamic programming solution would be more robust since it can consider all possible combinations. This would 
+improve the time complexity from O(n log n) to O(n) and handle all edge cases correctly."
+
+2. If there's an off-by-one error:
+"It's easy to introduce off-by-one errors in the array indexing. Make sure loops run to n-1 instead 
+of n to avoid accessing invalid memory. This type of error often causes buffer overflows in production."
+
+Don't overdo it. Be concise. Don't make assumptions about the code base other
+than what you observe in the code and test outputs.
+
+If you don't see any major issues, say nothing. Don't comment on code quality,
+error checking, testability or other nitpicks -- your only concern is whether
+the proposed code completely solves the users request.
+
+Output your initial analysis, and then any hints inside of block like this:
+
+BEGIN_HINTS
+...
+END_HINTS
+      
+Don't output hints unless you see a problem in the original code. If you don't have
+any hints, omit the hint block _entirely_, don't say "I don't have any hints."
+
+If the original request was responding to one or more errors, itemize the errors in your
+hint block as well as your suggestion for how to handle them.
+      """,
+            )
+        )
+        # get the proposed revisions
+        hash_object, completion = send_completion(
+            model.name,
+            messages,
+            functions,
+            self.stream,
+            temp,
+            extra_params=model.extra_params,
+        )
+        self.chat_completion_call_hashes.append(hash_object.hexdigest())
+        revision, function_calls = accumulate_stream(completion, streaming=self.stream)
+        if "BEGIN_HINTS" in revision:
+            hints = revision.split("BEGIN_HINTS")[1].split("END_HINTS")[0]
+            if hints.strip():
+                return hints
+        return None
+
     def send(self, messages, model=None, functions=None):
         if not model:
             model = self.main_model
@@ -1597,81 +1670,27 @@ class Coder:
             )
             self.chat_completion_call_hashes.append(hash_object.hexdigest())
 
-            text, function_calls = accumulate_stream(completion, streaming=self.stream)
+            original, function_calls = accumulate_stream(completion, streaming=self.stream)
 
-            # now give this back to the model and ask it to reflect on it's own output
-            messages.append(
-                dict(
-                    role="assistant",
-                    content=f"<TENTATIVE_RESPONSE>\n\n{text}\n\n</TENTATIVE_RESPONSE>",
-                )
-            )
-            messages.append(
-                dict(
-                    role="user",
-                    content="""
-Look at the above answer. Does this response satisfy the the request
-completely?  If not, what changes would you make to the response to better
-satisfy the user's request?  Explain your reasoning.
-
-If you are satisfied with the original response, you may copy it verbatim below. You must copy the entire response.
-
-If you detect a bug or missing condition, output a completely new answer, which
-corrects all the issues you have identified.  Your response _MUST_ conform to
-the edit format instructions specified or it will be rejected.
-
-Remember you can't reference anything inside of
-<TENTATIVE_RESPONSE>...</TENTATIVE_RESPONSE> tags when generating your diffs,
-you must generate diffs only against _user_ inputs! This is extremely important,
-and any diffs that do not follow this rule will be rejected.
-
-Here's a reminder of the rules for search/replace blocks:
-
-# *SEARCH/REPLACE block* Rules:
-
-Every *SEARCH/REPLACE block* must use this format:
-1. The *FULL* file path alone on a line, verbatim. No bold asterisks, no quotes around it, no escaping of characters, etc.
-2. The opening fence and code language, eg: {fence[0]}python
-3. The start of search block: <<<<<<< SEARCH
-4. A contiguous chunk of lines to search for in the existing source code
-5. The dividing line: =======
-6. The lines to replace into the source code
-7. The end of the replace block: >>>>>>> REPLACE
-8. The closing fence: {fence[1]}
-
-Use the *FULL* file path, as shown to you by the user.
-
-Every *SEARCH* section must *EXACTLY MATCH* the existing file content, character for character, including all comments, docstrings, etc.
-If the file contains code or other data wrapped/escaped in json/xml/quotes or other containers, you need to propose edits to the literal contents of the file, including the container markup.
-
-*SEARCH/REPLACE* blocks will *only* replace the first match occurrence.
-Including multiple unique *SEARCH/REPLACE* blocks if needed.
-Include enough lines in each SEARCH section to uniquely match each set of lines that need to change.
-
-Keep *SEARCH/REPLACE* blocks concise.
-Break large *SEARCH/REPLACE* blocks into a series of smaller blocks that each change a small portion of the file.
-Include just the changing lines, and a few surrounding lines if needed for uniqueness.
-Do not include long runs of unchanging lines in *SEARCH/REPLACE* blocks.
-
-Only create *SEARCH/REPLACE* blocks for files that the user has added to the chat!
-
-To move code within a file, use 2 *SEARCH/REPLACE* blocks: 1 to delete it from its current location, 1 to insert it in the new location.
-
-Pay attention to which filenames the user wants you to edit, especially if they are asking you to create a new file.
-
-If you want to put code in a new file, use a *SEARCH/REPLACE block* with:
-- A new file path, including dir name if needed
-- An empty `SEARCH` section
-- The new file's contents in the `REPLACE` section
-
-Remember that your response can only reference user code, and not any part of the <TENATIVE_RESPONSE>...</TENTATIVE_RESPONSE> block above.
-""",
-                )
+            # ask the model to reflect on the first response.
+            revision = self._compute_revision(
+                messages, original, model, functions, self.stream, temp
             )
 
-            # self.partial_response_content = text
-            # self.partial_response_function_call = function_calls
+            # okay, now let's go back to the model and have it supply new diffs.
+            if revision:
+                messages.append(
+                    dict(
+                        role="user",
+                        content=f"""
+  Here's some ideas on how you might best approach the problem. When producing
+  your answer, explain your reasoning and exactly how you plan to address each
+  proposed problem.
 
+  {revision}
+  """,
+                    )
+                )
             hash_object, completion = send_completion(
                 model.name,
                 messages,

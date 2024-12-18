@@ -2,7 +2,6 @@
 import datetime
 import json
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -260,13 +259,13 @@ def main(
         shutil.copytree(original_dname, dirname)
         print("...done")
 
-    test_dnames = sorted(os.listdir(dirname))
+    test_dnames = list(sorted(os.listdir(dirname)))
 
     if keywords:
         keywords = keywords.split(",")
         test_dnames = [dn for dn in test_dnames for keyword in keywords if keyword in dn]
 
-    random.shuffle(test_dnames)
+    # random.shuffle(test_dnames)
     if num_tests > 0:
         test_dnames = test_dnames[:num_tests]
 
@@ -780,7 +779,7 @@ def run_unit_tests(testdir, history_fname):
     ]
     print(" ".join(command))
 
-    timeout = 60
+    timeout = 10
 
     result = subprocess.run(
         command,
